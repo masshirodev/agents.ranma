@@ -4,14 +4,22 @@
 -- profile, repo, branch, busy or idle, and its ranma pane), and:
 --   - marks each agent pane's border: ● working, ? needs you (it went idle
 --     while you were not looking), nothing once you have seen it;
---   - toasts when an agent finishes out of sight;
+--   - toasts when an agent finishes out of sight, saying which agent
+--     (its session name and profile), what it was on, and where (session,
+--     workspace, pane); a click on the toast jumps to its pane (ranma with
+--     toast.on_click);
 --   - leader i opens a screen of every agent, grouped: Needs you, Working,
 --     Idle, with the selected one's last lines below.
 -- On the screen: enter jump to its pane, m message it (ai send), x stop it
--- (ctrl+c into its pane), o options.
+-- (esc into its pane), o options.
 --
 -- An agent that is not Claude Code reports no state to ai; it is listed as
--- running. On a machine without `ai`, the plugin stays quiet.
+-- running, and its screen is watched for a question (agents.ask). A Claude
+-- agent whose state is missing for a look (ai could not ask Claude) keeps
+-- the last one it had: it is never watched, as Claude's own footer reads
+-- like a question. One toast per wait: an agent already waiting on you is
+-- not toasted again until it has been busy. On a machine without `ai`, the
+-- plugin stays quiet.
 --
 -- ranma's plugin API: https://github.com/masshirodev/ranma/blob/main/doc/CONFIG.md.
 
@@ -28,7 +36,7 @@ ranma.option("agents.badges", {
   name = "Badges", desc = "Mark agent panes' borders: ● working, ? needs you.",
 })
 ranma.option("agents.ask", {
-  type = "string", default = [[(?i)(proceed\?|\(y/n\)|\[y/n\]|allow .*\?|approve|permission)]],
+  type = "string", default = [[(?i)(proceed\?|\(y/n\)|\[y/n\]|allow .*\?|approve .*\?|permission required)]],
   name = "Asking looks like",
   desc = "A regex for an agent asking something on its screen, for agents that tell ai nothing of their state (not Claude).",
 })
@@ -79,13 +87,51 @@ local function tail(p, n)
   return table.move(out, from, #out, 1, {})
 end
 
-local function jump(id)
-  local a = agents[id]
-  local p = a and pane_of(a)
+local function focus(p)
   if p then
     p:focus()
     if screen then screen:close(); screen = nil end
   end
+end
+
+local function jump(id)
+  local a = agents[id]
+  focus(a and pane_of(a))
+end
+
+-- Only Claude Code tells ai busy or idle; every other agent is watched.
+local function reports_state(peer)
+  return peer.provider == "claude"
+end
+
+-- Which agent: its session name (kumiko-87) and profile.
+local function who(peer, id)
+  local name = peer.name or peer.repo or (peer.folder or ""):match("[^/]+$") or id
+  local profile = peer.profile or peer.provider
+  return profile and (name .. " (" .. profile .. ")") or name
+end
+
+-- Where its pane is: the session when it is not the one shown, the
+-- workspace, the pane.
+local function where(peer)
+  local p = peer.pane and ranma.pane(tonumber(peer.pane))
+  if not p then return "" end
+  local bits = {}
+  if p.session ~= ranma.state().session then bits[#bits + 1] = p.session end
+  bits[#bits + 1] = p.workspace == 0 and "scratchpad" or ("ws " .. p.workspace)
+  bits[#bits + 1] = "pane " .. p.id
+  return " · " .. table.concat(bits, " · ")
+end
+
+-- A toast that jumps to the agent's pane when clicked, where ranma can.
+local clickable = ranma.has and ranma.has("toast.on_click")
+local function toast(peer, text)
+  local opts = { urgent = true }
+  local pane = tonumber(peer.pane)
+  if clickable and pane then
+    opts.on_click = function() focus(ranma.pane(pane)) end
+  end
+  ranma.toast(text .. where(peer), opts)
 end
 
 local function body()
@@ -166,11 +212,11 @@ end
 local function asked(id, e)
   local a = agents[id]
   local p = a and pane_of(a)
-  if not a or not p or p.visible then return end
+  -- Already waiting: the question redrawn is not a second one.
+  if not a or not p or p.visible or a.needs then return end
   a.needs, a.since = true, os.time()
   if ranma.get("agents.notify") then
-    ranma.toast((a.peer.repo or id) .. " · " .. (a.peer.profile or a.peer.provider or "") .. " asks: " .. e.row,
-      { urgent = true })
+    toast(a.peer, who(a.peer, id) .. " asks: " .. e.row:gsub("^%s+", ""):gsub("%s+$", ""))
   end
   badge(a)
   refresh_screen()
@@ -186,8 +232,12 @@ local function update(peers)
       local id = peer.id
       seen[id] = true
       order[#order + 1] = id
-      local state = peer.state or "running"
       local a = agents[id]
+      -- A Claude agent without a state is one ai could not ask this time,
+      -- not one that reports none: it keeps the last state it had.
+      local state = peer.state
+        or (reports_state(peer) and a and a.state)
+        or "running"
       if not a then
         a = { since = now }
         agents[id] = a
@@ -198,11 +248,11 @@ local function update(peers)
         if a.state == "busy" and state == "idle" then
           local p = peer.pane and ranma.pane(tonumber(peer.pane))
           local visible = p and p.visible
-          if not visible then
+          if not visible and not a.needs then
             a.needs = true
             if ranma.get("agents.notify") then
-              ranma.toast((peer.repo or id) .. " · " .. (peer.profile or "") .. " is done: " .. (peer.title or ""),
-                { urgent = true })
+              local title = peer.title and peer.title ~= "" and (": " .. peer.title) or ""
+              toast(peer, who(peer, id) .. " is done" .. title)
             end
           end
         end
@@ -210,7 +260,7 @@ local function update(peers)
       end
       a.peer, a.state = peer, state
       -- No state from ai: watch its screen for a question instead.
-      if state == "running" and not a.watch and peer.pane then
+      if state == "running" and not reports_state(peer) and not a.watch and peer.pane then
         local p = ranma.pane(tonumber(peer.pane))
         if p then
           local ok, w = pcall(p.watch, p, ranma.get("agents.ask"), function(e) asked(id, e) end)
